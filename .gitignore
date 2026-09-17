@@ -1,0 +1,22 @@
+node_modules/
+.env
+.env.*
+auth_info_baileys/
+wa_auth/
+bots/*/wa_auth/
+bots/*/kb_store/
+kb_store/
+kb_inbox/
+service-account.json
+"gemini key.txt"
+gemini*.txt
+outreach_targets.csv
+*.log
+*.csv
+qr-state.json
+bots/*/qr-state.json
+veyn-bi/
+.next/
+dist/
+bots/*/config.json
+bot-config.json

@@ -1,0 +1,25 @@
+{
+  "name": "veyn-assistant-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Veyn Assistant - strict-RAG WhatsApp knowledge-base bot (pilot)",
+  "scripts": {
+    "ingest": "node src/cli.mjs ingest",
+    "ask": "node src/cli.mjs ask",
+    "kb": "node src/cli.mjs",
+    "whatsapp": "node src/whatsapp.mjs",
+    "outreach": "node src/outreach.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "cheerio": "^1.0.0",
+    "google-auth-library": "^10.7.0",
+    "googleapis": "^173.0.0",
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

@@ -1,0 +1,386 @@
+// Lightweight CRM using Node's built-in SQLite (node:sqlite, Node 22+).
+// Tables: contacts, messages, handoff_queue.
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+import path from "node:path";
+import { CONFIG } from "./config.mjs";
+
+let db;
+
+export function getDb() {
+  if (db) return db;
+  fs.mkdirSync(path.dirname(CONFIG.crmDb), { recursive: true });
+  db = new DatabaseSync(CONFIG.crmDb);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      wa_id TEXT PRIMARY KEY,
+      name TEXT,
+      first_seen INTEGER,
+      last_seen INTEGER,
+      message_count INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      direction TEXT,          -- 'in' | 'out'
+      body TEXT,
+      reply_type TEXT,         -- answer | forward | greeting | admin | null
+      top_score REAL,
+      ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS handoff_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      name TEXT,
+      question TEXT,
+      reason TEXT,             -- below_threshold | model_declined | kb_empty
+      top_score REAL,
+      status TEXT DEFAULT 'open',  -- open | resolved
+      ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS outreach (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      name TEXT,
+      campaign TEXT,           -- e.g. 'autovox'
+      status TEXT,             -- sent | failed
+      error TEXT,
+      ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS demo_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      name TEXT,
+      campaign TEXT,
+      note TEXT,               -- prospect's message that triggered it
+      status TEXT DEFAULT 'link_sent',  -- link_sent | confirmed
+      ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS api_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      model TEXT,              -- e.g. gemini-2.5-flash
+      kind TEXT,               -- 'generate' | 'embed'
+      in_tokens INTEGER DEFAULT 0,
+      out_tokens INTEGER DEFAULT 0,
+      total_tokens INTEGER DEFAULT 0,
+      cost_usd REAL DEFAULT 0,
+      ts INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_usage_ts ON api_usage (ts);
+    CREATE INDEX IF NOT EXISTS idx_api_usage_wa_ts ON api_usage (wa_id, ts);
+  `);
+  // Add campaign column to contacts if upgrading an older DB (ignore if exists).
+  try { db.exec("ALTER TABLE contacts ADD COLUMN campaign TEXT"); } catch {}
+  // Add preferred_lang column to persist per-user language preference.
+  try { db.exec("ALTER TABLE contacts ADD COLUMN preferred_lang TEXT"); } catch {}
+  // Add email column for lead capture.
+  try { db.exec("ALTER TABLE contacts ADD COLUMN email TEXT"); } catch {}
+  // Add awaiting_email flag — set when bot asks user for their email.
+  try { db.exec("ALTER TABLE contacts ADD COLUMN awaiting_email INTEGER DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE contacts ADD COLUMN pending_interest TEXT"); } catch {}
+  // Lead capture log: records when a user provided their email for follow-up.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lead_captures (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wa_id TEXT,
+      name TEXT,
+      email TEXT,
+      interest TEXT,
+      ts INTEGER
+    );
+  `);
+  // User personality & preference memory — persists across sessions.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      wa_id TEXT PRIMARY KEY,
+      interests TEXT DEFAULT '[]',       -- JSON array: topics/products they've asked about
+      preferences TEXT DEFAULT '{}',     -- JSON object: explicit stated preferences
+      personality_tags TEXT DEFAULT '[]',-- JSON array: inferred signals (price_sensitive, etc.)
+      budget_hint TEXT,                  -- 'budget' | 'mid-range' | 'premium' | null
+      updated_at INTEGER
+    );
+  `);
+  return db;
+}
+
+const now = () => Date.now();
+
+export function upsertContact(waId, name) {
+  const d = getDb();
+  const t = now();
+  const existing = d.prepare("SELECT wa_id FROM contacts WHERE wa_id=?").get(waId);
+  if (existing) {
+    d.prepare("UPDATE contacts SET last_seen=?, message_count=message_count+1, name=COALESCE(?,name) WHERE wa_id=?")
+      .run(t, name || null, waId);
+  } else {
+    d.prepare("INSERT INTO contacts (wa_id,name,first_seen,last_seen,message_count) VALUES (?,?,?,?,1)")
+      .run(waId, name || null, t, t);
+  }
+}
+
+export function logMessage(waId, direction, body, replyType = null, topScore = null) {
+  getDb().prepare("INSERT INTO messages (wa_id,direction,body,reply_type,top_score,ts) VALUES (?,?,?,?,?,?)")
+    .run(waId, direction, body, replyType, topScore, now());
+}
+
+export function queueHandoff(waId, name, question, reason, topScore = null) {
+  getDb().prepare("INSERT INTO handoff_queue (wa_id,name,question,reason,top_score,status,ts) VALUES (?,?,?,?,?, 'open', ?)")
+    .run(waId, name || null, question, reason, topScore, now());
+}
+
+export function listHandoffs(status = "open") {
+  return getDb().prepare("SELECT * FROM handoff_queue WHERE status=? ORDER BY ts DESC").all(status);
+}
+
+export function resolveHandoff(id) {
+  getDb().prepare("UPDATE handoff_queue SET status='resolved' WHERE id=?").run(id);
+}
+
+export function stats() {
+  const d = getDb();
+  const contacts = d.prepare("SELECT COUNT(*) c FROM contacts").get().c;
+  const msgs = d.prepare("SELECT COUNT(*) c FROM messages").get().c;
+  const openHandoffs = d.prepare("SELECT COUNT(*) c FROM handoff_queue WHERE status='open'").get().c;
+  const sent = d.prepare("SELECT COUNT(*) c FROM outreach WHERE status='sent'").get().c;
+  const demos = d.prepare("SELECT COUNT(*) c FROM demo_requests").get().c;
+  return { contacts, msgs, openHandoffs, outreachSent: sent, demos };
+}
+
+// Tag a contact with the campaign they belong to (so replies route on-topic).
+export function setCampaign(waId, campaign) {
+  getDb().prepare("UPDATE contacts SET campaign=? WHERE wa_id=?").run(campaign, waId);
+}
+
+export function getCampaign(waId) {
+  const row = getDb().prepare("SELECT campaign FROM contacts WHERE wa_id=?").get(waId);
+  return row?.campaign || null;
+}
+
+// Per-user language preference — set when a user explicitly asks to switch language.
+export function setPreferredLang(waId, lang) {
+  getDb().prepare("UPDATE contacts SET preferred_lang=? WHERE wa_id=?").run(lang, waId);
+}
+
+export function getPreferredLang(waId) {
+  const row = getDb().prepare("SELECT preferred_lang FROM contacts WHERE wa_id=?").get(waId);
+  return row?.preferred_lang || null;
+}
+
+// Record an outreach send attempt.
+export function logOutreach(waId, name, campaign, status, error = null) {
+  getDb().prepare("INSERT INTO outreach (wa_id,name,campaign,status,error,ts) VALUES (?,?,?,?,?,?)")
+    .run(waId, name || null, campaign, status, error, now());
+}
+
+// Fetch last N messages for a user as conversation history (in/out pairs).
+// Returns [{role, text}] oldest-first, ready to pass to Gemini multi-turn.
+export function getHistory(waId, limit = 6) {
+  const rows = getDb()
+    .prepare(
+      "SELECT direction, body FROM messages WHERE wa_id=? AND direction IN ('in','out') ORDER BY ts DESC LIMIT ?"
+    )
+    .all(waId, limit);
+  // Reverse so oldest is first (Gemini expects chronological order)
+  return rows.reverse().map((r) => ({
+    role: r.direction === "in" ? "user" : "model",
+    text: r.body,
+  }));
+}
+
+// Has this number already been contacted for this campaign? (avoid double cold-sends)
+export function alreadyContacted(waId, campaign) {
+  const row = getDb()
+    .prepare("SELECT 1 FROM outreach WHERE wa_id=? AND campaign=? AND status='sent' LIMIT 1")
+    .get(waId, campaign);
+  return !!row;
+}
+
+// Record a demo request (link shared / to be confirmed).
+export function logDemoRequest(waId, name, campaign, note) {
+  getDb().prepare("INSERT INTO demo_requests (wa_id,name,campaign,note,status,ts) VALUES (?,?,?,?, 'link_sent', ?)")
+    .run(waId, name || null, campaign, note || null, now());
+}
+
+export function listDemoRequests() {
+  return getDb().prepare("SELECT * FROM demo_requests ORDER BY ts DESC").all();
+}
+
+// --- API usage / cost tracking (guardrails) ---
+
+// Estimate USD cost from token counts using config pricing.
+function estimateCost(model, inTokens, outTokens) {
+  const p = CONFIG.pricing?.[model];
+  if (!p) return 0;
+  return (inTokens / 1e6) * (p.inPerM || 0) + (outTokens / 1e6) * (p.outPerM || 0);
+}
+
+// Record one Gemini API call's token usage + estimated cost.
+export function logApiUsage(waId, model, kind, inTokens = 0, outTokens = 0) {
+  const total = (inTokens || 0) + (outTokens || 0);
+  const cost = estimateCost(model, inTokens, outTokens);
+  getDb()
+    .prepare(
+      "INSERT INTO api_usage (wa_id,model,kind,in_tokens,out_tokens,total_tokens,cost_usd,ts) VALUES (?,?,?,?,?,?,?,?)"
+    )
+    .run(waId || null, model, kind, inTokens || 0, outTokens || 0, total, cost, now());
+  return cost;
+}
+
+// Start of the current local day in ms (used for the daily cap window).
+function startOfTodayMs() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// Total estimated USD spent so far today.
+export function todaySpendUsd() {
+  const row = getDb()
+    .prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM api_usage WHERE ts >= ?")
+    .get(startOfTodayMs());
+  return row.c || 0;
+}
+
+// How many generate (AI answer) calls a number made in the last hour.
+export function userCallsLastHour(waId) {
+  const since = now() - 3600 * 1000;
+  const row = getDb()
+    .prepare("SELECT COUNT(*) c FROM api_usage WHERE wa_id=? AND kind='generate' AND ts >= ?")
+    .get(waId, since);
+  return row.c || 0;
+}
+
+// --- Lead capture (email collection) ---
+
+export function setEmail(waId, email) {
+  getDb().prepare("UPDATE contacts SET email=? WHERE wa_id=?").run(email, waId);
+}
+
+export function getEmail(waId) {
+  const row = getDb().prepare("SELECT email FROM contacts WHERE wa_id=?").get(waId);
+  return row?.email || null;
+}
+
+export function logLeadCapture(waId, name, email, interest) {
+  getDb()
+    .prepare("INSERT INTO lead_captures (wa_id,name,email,interest,ts) VALUES (?,?,?,?,?)")
+    .run(waId, name || null, email, interest || null, Date.now());
+}
+
+export function getLeadCapture(waId) {
+  return getDb()
+    .prepare("SELECT * FROM lead_captures WHERE wa_id=? ORDER BY ts DESC LIMIT 1")
+    .get(waId) || null;
+}
+
+// Whether the bot is currently waiting for this user's email
+export function isAwaitingEmail(waId) {
+  const row = getDb().prepare("SELECT awaiting_email FROM contacts WHERE wa_id=?").get(waId);
+  return !!row?.awaiting_email;
+}
+
+export function setAwaitingEmail(waId, flag, interest = null) {
+  if (interest !== null) {
+    getDb().prepare("UPDATE contacts SET awaiting_email=?, pending_interest=? WHERE wa_id=?").run(flag ? 1 : 0, interest, waId);
+  } else {
+    getDb().prepare("UPDATE contacts SET awaiting_email=? WHERE wa_id=?").run(flag ? 1 : 0, waId);
+  }
+}
+
+export function getPendingInterest(waId) {
+  const row = getDb().prepare("SELECT pending_interest FROM contacts WHERE wa_id=?").get(waId);
+  return row?.pending_interest || null;
+}
+
+// --- User profile / personality memory ---
+
+export function getProfile(waId) {
+  const row = getDb().prepare("SELECT * FROM user_profiles WHERE wa_id=?").get(waId);
+  if (!row) return { interests: [], preferences: {}, personality_tags: [], budget_hint: null };
+  return {
+    interests: safeJson(row.interests, []),
+    preferences: safeJson(row.preferences, {}),
+    personality_tags: safeJson(row.personality_tags, []),
+    budget_hint: row.budget_hint || null,
+  };
+}
+
+// Merge new data into the user profile (upsert pattern).
+export function updateProfile(waId, { interests, preferences, personality_tags, budget_hint } = {}) {
+  const existing = getProfile(waId);
+  const merged = {
+    interests: dedupeArray([...existing.interests, ...(interests || [])]).slice(-30),
+    preferences: { ...existing.preferences, ...(preferences || {}) },
+    personality_tags: dedupeArray([...existing.personality_tags, ...(personality_tags || [])]),
+    budget_hint: budget_hint !== undefined ? budget_hint : existing.budget_hint,
+  };
+  getDb().prepare(`
+    INSERT INTO user_profiles (wa_id, interests, preferences, personality_tags, budget_hint, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wa_id) DO UPDATE SET
+      interests=excluded.interests,
+      preferences=excluded.preferences,
+      personality_tags=excluded.personality_tags,
+      budget_hint=excluded.budget_hint,
+      updated_at=excluded.updated_at
+  `).run(
+    waId,
+    JSON.stringify(merged.interests),
+    JSON.stringify(merged.preferences),
+    JSON.stringify(merged.personality_tags),
+    merged.budget_hint,
+    Date.now()
+  );
+}
+
+// Detect budget signal from user message text.
+// Returns 'budget' | 'premium' | 'mid-range' | null
+export function detectBudgetSignal(text) {
+  const s = text.toLowerCase();
+  if (/\b(cheap|cheapest|affordable|low.?cost|low budget|tight budget|budget.?(friendly|option|plan)|save money|economical|inexpensive|entry.?level|basic plan)\b/.test(s)) return "budget";
+  if (/\b(best|premium|top.?(tier|end)|high.?end|luxury|enterprise|unlimited|professional|advanced plan|flagship)\b/.test(s)) return "premium";
+  if (/\b(mid.?(range|tier|level)|moderate|reasonable|standard plan|middle)\b/.test(s)) return "mid-range";
+  return null;
+}
+
+// Detect personality tags from a user message.
+// Returns array of tag strings (may be empty).
+export function detectPersonalityTags(text) {
+  const s = text.toLowerCase();
+  const tags = [];
+  if (/\b(price|cost|how much|expensive|cheap|afford|budget|pricing)\b/.test(s)) tags.push("price_sensitive");
+  if (/\b(compare|vs|versus|difference|better than|alternative|competitor|other option)\b/.test(s)) tags.push("comparison_shopper");
+  if (/\b(spec|technical|api|integration|feature|compatibility|requirement|architecture|detailed|exactly how|how does it work)\b/.test(s)) tags.push("tech_savvy");
+  if (/\b(urgent|asap|today|this week|immediately|right away|quick|fast)\b/.test(s)) tags.push("high_urgency");
+  return tags;
+}
+
+function safeJson(str, fallback) {
+  try { return JSON.parse(str); } catch { return fallback; }
+}
+
+function dedupeArray(arr) {
+  return [...new Set(arr)];
+}
+
+// --- Usage summary for the `usage` admin command.
+export function usageSummary() {
+  const d = getDb();
+  const today = startOfTodayMs();
+  const t = d
+    .prepare(
+      "SELECT COUNT(*) calls, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(cost_usd),0) cost FROM api_usage WHERE ts >= ?"
+    )
+    .get(today);
+  const all = d
+    .prepare(
+      "SELECT COUNT(*) calls, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(cost_usd),0) cost FROM api_usage"
+    )
+    .get();
+  return {
+    today: { calls: t.calls, tokens: t.tok, cost: t.cost },
+    allTime: { calls: all.calls, tokens: all.tok, cost: all.cost },
+    capUsd: CONFIG.dailyCostCapUsd,
+  };
+}
